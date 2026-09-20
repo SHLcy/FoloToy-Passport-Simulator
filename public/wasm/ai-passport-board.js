@@ -38,7 +38,7 @@ export class AiPassportBoard {
   }
 
   drain(options = {}) {
-    for (const event of this.bridge.drain()) {
+    for (const event of this.bridge.drain({ copyPayload: false })) {
       if (event.type === 'mmio') {
         this.audio.handleRegisterWrite(event.address, event.value);
         if (event.peripheral === 1) {
@@ -104,8 +104,8 @@ export class AiPassportBoard {
     this.bridge.wasm.ap_board_set_gpio_input(0, 1);
   }
 
-  pushMicrophone(bytes) {
-    this.audio.pushMicrophone(bytes);
+  pushMicrophone(samples, sampleRate) {
+    this.audio.pushMicrophone(samples, sampleRate);
   }
 
   pumpAudio(now, force = false) {

@@ -1,6 +1,7 @@
 import init, { WasmEmulator } from "./pkg/esp_emu.js";
 import { AiPassportBoard } from "./ai-passport-board.js";
 import { detectUnsupportedFeature } from "./unsupported-features.js";
+import { RealtimeClock } from "./realtime-clock.js";
 import {
   EMULATOR_WIFI_PASSWORD,
   EMULATOR_WIFI_SSID,
@@ -8,7 +9,7 @@ import {
 } from "./network.js";
 
 const DEFAULT_BATCH_SIZE = 50_000;
-const FRAME_BUDGET_MS = 8;
+const FRAME_BUDGET_MS = 6;
 const DEBUG_INTERVAL_MS = 250;
 const CLICK_CYCLES = 12_000_000;
 const DOUBLE_GAP_CYCLES = 16_000_000;
@@ -24,6 +25,17 @@ let generation = 0;
 let lastDebugAt = 0;
 let buttonTransitions = [];
 let buttonBusyUntil = 0;
+let framePending = false;
+let cpuDebugEnabled = false;
+let lastAudioFormat = "";
+let lastDroppedEvents = 0;
+let realtimeClock;
+let lastMicStatsAt = 0;
+const buttonPressCycles = new Map();
+// A nested setTimeout(0) is clamped to 4 ms in browsers. MessageChannel yields
+// for input/network work without throwing away a third of the CPU budget.
+const runQueue = new MessageChannel();
+runQueue.port1.onmessage = (event) => runLoop(event.data);
 
 function reportProgress(value, stage, detail) {
   postMessage({ type: "progress", value, stage, detail });
@@ -50,6 +62,7 @@ function copyDirtyPixels(frame) {
 }
 
 function reportFrame(frame) {
+  framePending = true;
   const pixels = copyDirtyPixels(frame);
   postMessage({
     type: "frame",
@@ -63,12 +76,16 @@ function reportFrame(frame) {
 }
 
 function reportAudio(packet) {
+  const format = `${packet.sampleRate}:${packet.bits}:${packet.channels}`;
+  if (format !== lastAudioFormat) {
+    lastAudioFormat = format;
   postMessage({
     type: "audio_config",
     sampleRate: packet.sampleRate,
     bits: packet.bits,
     channels: packet.channels,
   });
+  }
   postMessage(packet, [packet.bytes.buffer]);
 }
 
@@ -87,6 +104,10 @@ function createBoard() {
   board.releaseButtons();
   buttonTransitions = [];
   buttonBusyUntil = emulator.cycles();
+  buttonPressCycles.clear();
+  lastAudioFormat = "";
+  lastDroppedEvents = 0;
+  realtimeClock = new RealtimeClock(performance.now(), emulator.cycles());
 }
 
 function queueButtonGesture(name, gesture) {
@@ -119,7 +140,7 @@ function serviceButtonTransitions() {
 }
 
 function postDebugSnapshot(now) {
-  if (!emulator || now - lastDebugAt < DEBUG_INTERVAL_MS) return;
+  if (!emulator || !cpuDebugEnabled || now - lastDebugAt < DEBUG_INTERVAL_MS) return;
   lastDebugAt = now;
   const registers = new Uint32Array(32);
   for (let index = 0; index < registers.length; index += 1) {
@@ -137,6 +158,7 @@ async function start(firmware, debugEnabled = false) {
   running = false;
   network?.close();
   networkDebugEnabled = Boolean(debugEnabled);
+  framePending = false;
   const currentGeneration = ++generation;
   reportProgress(70, "正在初始化 WebAssembly", "编译并载入 ESP32-C3 模拟核心");
   wasm = await init();
@@ -186,7 +208,8 @@ function runLoop(currentGeneration) {
   while (
     running &&
     currentGeneration === generation &&
-    performance.now() - started < FRAME_BUDGET_MS
+    performance.now() - started < FRAME_BUDGET_MS &&
+    emulator.cycles() < realtimeClock.target(performance.now(), emulator.cycles())
   ) {
     serviceButtonTransitions();
     uart += emulator.run_batch(DEFAULT_BATCH_SIZE);
@@ -203,20 +226,32 @@ function runLoop(currentGeneration) {
     network?.drain();
     if (emulator.needs_restart()) restart();
   }
-  board.flushFrame();
+  // Keep at most one frame in transit. Dirty regions continue accumulating until
+  // the browser presents it; slow painting cannot build an ever-growing queue.
+  if (!framePending) board.flushFrame();
   if (uart) {
     postMessage({ type: "uart", data: uart });
   }
   const now = performance.now();
+  if (board.audio.micStats.capturedFrames && now - lastMicStatsAt >= 500) {
+    lastMicStatsAt = now;
+    postMessage({ type: 'microphone-status', detail: {
+      ...board.audio.micStats, queuedBytes: board.audio.microphone.length,
+    } });
+  }
   postDebugSnapshot(now);
   const dropped = board.droppedEvents();
-  if (dropped) {
+  if (dropped > lastDroppedEvents) {
     postMessage({
       type: "warning",
-      message: `${dropped} board events were dropped`,
+      message: `${dropped - lastDroppedEvents} board events were dropped`,
     });
   }
-  setTimeout(() => runLoop(currentGeneration), 0);
+  lastDroppedEvents = dropped;
+  if (performance.now() - started < FRAME_BUDGET_MS) {
+    // The virtual device has caught up; leave CPU time for painting/encoding.
+    setTimeout(() => runLoop(currentGeneration), 2);
+  } else runQueue.port2.postMessage(currentGeneration);
 }
 
 self.addEventListener("message", async (event) => {
@@ -229,18 +264,38 @@ self.addEventListener("message", async (event) => {
         // A physical hold supersedes any synthetic gesture for this key.
         buttonTransitions = buttonTransitions.filter(t => t.name !== event.data.name);
         buttonBusyUntil = buttonTransitions.at(-1)?.cycle ?? emulator?.cycles() ?? 0;
-        board?.setButton(event.data.name, event.data.pressed);
+        if (!board) break;
+        if (event.data.pressed) {
+          buttonPressCycles.set(event.data.name, emulator.cycles());
+          board.setButton(event.data.name, true);
+        } else {
+          const start = buttonPressCycles.get(event.data.name);
+          buttonPressCycles.delete(event.data.name);
+          const releaseAt = (start ?? -CLICK_CYCLES) + CLICK_CYCLES;
+          if (releaseAt > emulator.cycles()) {
+            buttonTransitions.push({ cycle: releaseAt, name: event.data.name, pressed: false });
+            buttonTransitions.sort((a, b) => a.cycle - b.cycle);
+          } else board.setButton(event.data.name, false);
+        }
+        break;
+      case "frame-presented":
+        framePending = false;
+        break;
+      case "cpu-debug":
+        cpuDebugEnabled = Boolean(event.data.enabled);
+        lastDebugAt = 0;
         break;
       case "button-gesture":
         if (board) queueButtonGesture(event.data.name, event.data.gesture);
         break;
       case "release-buttons":
         buttonTransitions = [];
+        buttonPressCycles.clear();
         buttonBusyUntil = emulator?.cycles() ?? 0;
         board?.releaseButtons();
         break;
       case "microphone":
-        board?.pushMicrophone(event.data.bytes);
+        board?.pushMicrophone(event.data.samples, event.data.sampleRate);
         break;
       case "uart-input":
         emulator?.uart_input(new Uint8Array(event.data.bytes));

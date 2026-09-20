@@ -1,0 +1,4 @@
+key,type,encoding,value
+wifi,namespace,,
+ssid,data,string,Emulator Host Bridge
+password,data,string,

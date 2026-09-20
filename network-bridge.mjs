@@ -33,6 +33,8 @@ const TCP_RST = 0x04;
 const TCP_PSH = 0x08;
 const TCP_ACK = 0x10;
 const TCP_MSS = 1300;
+// Keep several segments in flight so lwIP's delayed ACK does not throttle streams.
+const TCP_SEND_WINDOW = 8 * TCP_MSS;
 const MAX_TCP_CONNECTIONS = 64;
 const MAX_TCP_QUEUED_BYTES = 1024 * 1024;
 const TCP_PAUSE_BYTES = 64 * 1024;
@@ -111,7 +113,8 @@ class TcpFlow {
     this.state = "connecting";
     this.queue = [];
     this.queuedBytes = 0;
-    this.inFlight = null;
+    this.inFlight = [];
+    this.hostAcknowledged = this.hostInitial;
     this.remoteEnded = false;
     this.guestEnded = false;
     this.closed = false;
@@ -142,13 +145,12 @@ class TcpFlow {
 
   handle(tcp) {
     this.lastActivity = Date.now();
-    this.remoteWindow = tcp.window;
     if (tcp.flags & TCP_RST) {
       this.close();
       return;
     }
 
-    if (tcp.flags & TCP_ACK) this.#handleAcknowledgment(tcp.acknowledgment);
+    if (tcp.flags & TCP_ACK) this.#handleAcknowledgment(tcp.acknowledgment, tcp.window);
     if (this.closed) return;
 
     if (tcp.payload.byteLength) {
@@ -167,7 +169,7 @@ class TcpFlow {
       this.guestEnded = true;
       this.#sendSegment(TCP_ACK);
       this.socket.end();
-      if (this.remoteEnded && !this.inFlight) this.close(false);
+      if (this.remoteEnded && this.state === "fin-acked") this.close(false);
     }
     this.#pump();
   }
@@ -186,19 +188,28 @@ class TcpFlow {
     this.hostNext = end;
   }
 
-  #handleAcknowledgment(acknowledgment) {
-    if (!this.inFlight || !sequenceAtOrAfter(acknowledgment, this.inFlight.end)) {
+  #handleAcknowledgment(acknowledgment, window) {
+    // Ignore stale/impossible ACKs, including across sequence-number wraparound.
+    if (!sequenceAtOrAfter(acknowledgment, this.hostAcknowledged) ||
+        !sequenceAtOrAfter(this.hostNext, acknowledgment)) {
       return;
     }
-    clearTimeout(this.inFlight.timer);
-    const kind = this.inFlight.kind;
-    this.inFlight = null;
-    if (kind === "syn") this.state = "established";
-    if (kind === "fin") {
-      this.close(false);
-      return;
+    this.hostAcknowledged = acknowledgment;
+    this.remoteWindow = window;
+    while (this.inFlight.length &&
+           sequenceAtOrAfter(acknowledgment, this.inFlight[0].end)) {
+      const tracked = this.inFlight.shift();
+      clearTimeout(tracked.timer);
+      if (tracked.kind === "syn") this.state = "established";
+      if (tracked.kind === "fin") {
+        this.state = "fin-acked";
+        if (this.guestEnded) this.close(false);
+        else {
+          this.finTimer = setTimeout(() => this.close(false), 30_000);
+          this.finTimer.unref?.();
+        }
+      }
     }
-    this.#pump();
   }
 
   #receiveRemote(data) {
@@ -228,14 +239,15 @@ class TcpFlow {
     if (
       this.closed ||
       this.state !== "established" ||
-      this.inFlight ||
       this.remoteWindow === 0
     ) {
       return;
     }
-    const queued = this.queue[0];
-    if (queued) {
-      const length = Math.min(queued.byteLength, TCP_MSS, this.remoteWindow);
+    let available = Math.min(this.remoteWindow, TCP_SEND_WINDOW) -
+      ((this.hostNext - this.hostAcknowledged) >>> 0);
+    while (this.queue.length && available > 0) {
+      const queued = this.queue[0];
+      const length = Math.min(queued.byteLength, TCP_MSS, available);
       const payload = queued.slice(0, length);
       if (length === queued.byteLength) this.queue.shift();
       else this.queue[0] = queued.slice(length);
@@ -244,12 +256,13 @@ class TcpFlow {
       const end = (this.hostNext + payload.byteLength) >>> 0;
       this.#sendTracked(TCP_PSH | TCP_ACK, payload, end, "data");
       this.hostNext = end;
-      return;
+      available -= length;
     }
-    if (this.remoteEnded) {
+    if (this.remoteEnded && !this.queue.length && !this.inFlight.length && available > 0) {
       const end = (this.hostNext + 1) >>> 0;
       this.#sendTracked(TCP_FIN | TCP_ACK, new Uint8Array(), end, "fin");
       this.hostNext = end;
+      this.state = "fin-sent";
     }
   }
 
@@ -279,7 +292,7 @@ class TcpFlow {
     const frame = this.#sendSegment(flags, payload, options);
     const tracked = { frame, end, kind, attempts: 0, timer: null };
     const retry = () => {
-      if (this.closed || this.inFlight !== tracked) return;
+      if (this.closed || !this.inFlight.includes(tracked)) return;
       if (tracked.attempts >= MAX_RETRANSMITS) {
         this.#fail("guest acknowledgment timeout");
         return;
@@ -291,7 +304,7 @@ class TcpFlow {
     };
     tracked.timer = setTimeout(retry, RETRANSMIT_MS);
     tracked.timer.unref?.();
-    this.inFlight = tracked;
+    this.inFlight.push(tracked);
   }
 
   #fail(reason) {
@@ -309,7 +322,9 @@ class TcpFlow {
   close(destroySocket = true) {
     if (this.closed) return;
     this.closed = true;
-    clearTimeout(this.inFlight?.timer);
+    clearTimeout(this.finTimer);
+    for (const tracked of this.inFlight) clearTimeout(tracked.timer);
+    this.inFlight = [];
     if (destroySocket) this.socket.destroy?.();
     this.session.deleteTcpFlow(this);
     this.session.emitEvent({

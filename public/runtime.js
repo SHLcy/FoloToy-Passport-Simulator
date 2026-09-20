@@ -6,6 +6,7 @@ export class QemuRuntime extends EventTarget {
   #ready = false;
   #manifest = null;
   #networkDebug = false;
+  #cpuDebug = false;
 
   async start(firmwareUrl) {
     this.#ready = false;
@@ -97,6 +98,7 @@ export class QemuRuntime extends EventTarget {
       networkDebug: this.#networkDebug,
     };
     this.#worker.postMessage(message, [firmware]);
+    this.setCpuDebug(this.#cpuDebug);
   }
 
   setButton(name, pressed) {
@@ -119,10 +121,10 @@ export class QemuRuntime extends EventTarget {
     return true;
   }
 
-  sendMicrophone(bytes) {
+  sendMicrophone(samples, sampleRate) {
     if (!this.#ready || !this.#worker) return false;
-    const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-    this.#worker.postMessage({ type: "microphone", bytes: data }, [data.buffer]);
+    const data = samples instanceof Float32Array ? samples : new Float32Array(samples);
+    this.#worker.postMessage({ type: "microphone", samples: data, sampleRate }, [data.buffer]);
     return true;
   }
 
@@ -139,6 +141,11 @@ export class QemuRuntime extends EventTarget {
       type: "network-debug",
       enabled: this.#networkDebug,
     });
+  }
+
+  setCpuDebug(enabled) {
+    this.#cpuDebug = Boolean(enabled);
+    this.#worker?.postMessage({ type: "cpu-debug", enabled: this.#cpuDebug });
   }
 
   restart() {
@@ -165,11 +172,18 @@ export class QemuRuntime extends EventTarget {
       this.#reportProgress(100, "装载完成", "固件已启动");
       this.dispatchEvent(new CustomEvent("state", { detail: "running" }));
     } else if (type === "frame") {
-      this.dispatchEvent(new CustomEvent("frame", { detail: event.data }));
+      const worker = this.#worker;
+      requestAnimationFrame(() => {
+        if (this.#worker !== worker) return;
+        this.dispatchEvent(new CustomEvent("frame", { detail: event.data }));
+        worker.postMessage({ type: "frame-presented" });
+      });
     } else if (type === "uart") {
       this.dispatchEvent(new CustomEvent("uart", { detail: event.data.data }));
     } else if (type === "audio_config") {
       this.dispatchEvent(new CustomEvent("audio-config", { detail: event.data }));
+    } else if (type === "microphone-status") {
+      this.dispatchEvent(new CustomEvent("microphone-status", { detail: event.data.detail }));
     } else if (type === "audio") {
       this.dispatchEvent(new CustomEvent("audio", { detail: event.data }));
     } else if (type === "debug") {

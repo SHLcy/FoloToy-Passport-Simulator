@@ -2,6 +2,15 @@
 
 const WIDTH = 240;
 const HEIGHT = 320;
+// Convert RGB565 once, then write a complete RGBA pixel with one store.
+const COLOR_BYTES = new Uint8ClampedArray(65536 * 4);
+for (let color = 0; color < 65536; color++) {
+  COLOR_BYTES[color * 4] = Math.round(((color >>> 11) & 31) * 255 / 31);
+  COLOR_BYTES[color * 4 + 1] = Math.round(((color >>> 5) & 63) * 255 / 63);
+  COLOR_BYTES[color * 4 + 2] = Math.round((color & 31) * 255 / 31);
+  COLOR_BYTES[color * 4 + 3] = 255;
+}
+const COLORS = new Uint32Array(COLOR_BYTES.buffer);
 
 const COMMANDS = Object.freeze({
   SWRESET: 0x01,
@@ -73,6 +82,7 @@ class ST7789 {
     this.csActiveLow = options.csActiveLow !== false;
     this.nativeInverted = options.nativeInverted === true;
     this.framebuffer = new Uint8ClampedArray(this.width * this.height * 4);
+    this._pixels32 = new Uint32Array(this.framebuffer.buffer);
     this._dirty = null;
     this._initialize(false);
   }
@@ -318,43 +328,40 @@ class ST7789 {
       return;
     }
 
-    for (const byte of bytes) {
-      if (this._pixelByte === null) {
-        this._pixelByte = byte;
-        continue;
-      }
-      const rgb565 = this.byteOrder === 'big'
-        ? (this._pixelByte << 8) | byte
-        : (byte << 8) | this._pixelByte;
+    let offset = 0;
+    let x = this.cursorX, y = this.cursorY;
+    let left = this.width, top = this.height, right = -1, bottom = -1;
+    const mx = Boolean(this.madctl & 0x40), my = Boolean(this.madctl & 0x80);
+    const mv = Boolean(this.madctl & 0x20), bgr = Boolean(this.madctl & 0x08);
+    const invert = this.inverted !== this.nativeInverted;
+    const big = this.byteOrder === 'big';
+    const validWindow = this.columnStart <= this.columnEnd && this.rowStart <= this.rowEnd;
+    while (offset < bytes.length) {
+      const first = this._pixelByte === null ? bytes[offset++] : this._pixelByte;
+      if (offset === bytes.length) { this._pixelByte = first; break; }
       this._pixelByte = null;
-      this._writePixel(rgb565);
+      const second = bytes[offset++];
+      let color = big ? (first << 8) | second : (second << 8) | first;
+      if (bgr) color = (color & 0x07e0) | ((color & 31) << 11) | (color >>> 11);
+      if (invert) color ^= 0xffff;
+      const px = mv ? (my ? this.width - 1 - y : y) : (mx ? this.width - 1 - x : x);
+      const py = mv ? (mx ? this.height - 1 - x : x) : (my ? this.height - 1 - y : y);
+      if (px >= 0 && px < this.width && py >= 0 && py < this.height) {
+        const index = py * this.width + px;
+        const rgba = COLORS[color];
+        if (this._pixels32[index] !== rgba) {
+          this._pixels32[index] = rgba;
+          left = Math.min(left, px); top = Math.min(top, py);
+          right = Math.max(right, px); bottom = Math.max(bottom, py);
+        }
+      }
+      if (validWindow && ++x > this.columnEnd) {
+        x = this.columnStart;
+        if (++y > this.rowEnd) y = this.rowStart;
+      }
     }
-  }
-
-  _writePixel(rgb565) {
-    const sourceX = this.cursorX;
-    const sourceY = this.cursorY;
-    this._advanceCursor();
-
-    const point = this._mapCoordinate(sourceX, sourceY);
-    if (point.x < 0 || point.x >= this.width || point.y < 0 || point.y >= this.height) {
-      return;
-    }
-
-    let red = Math.round(((rgb565 >> 11) & 0x1f) * 255 / 31);
-    const green = Math.round(((rgb565 >> 5) & 0x3f) * 255 / 63);
-    let blue = Math.round((rgb565 & 0x1f) * 255 / 31);
-    if (this.madctl & 0x08) {
-      [red, blue] = [blue, red];
-    }
-
-    const offset = (point.y * this.width + point.x) * 4;
-    const invertOutput = this.inverted !== this.nativeInverted;
-    this.framebuffer[offset] = invertOutput ? 255 - red : red;
-    this.framebuffer[offset + 1] = invertOutput ? 255 - green : green;
-    this.framebuffer[offset + 2] = invertOutput ? 255 - blue : blue;
-    this.framebuffer[offset + 3] = 255;
-    this._markDirty(point.x, point.y);
+    this.cursorX = x; this.cursorY = y;
+    if (right >= left) { this._markDirty(left, top); this._markDirty(right, bottom); }
   }
 
   _advanceCursor() {

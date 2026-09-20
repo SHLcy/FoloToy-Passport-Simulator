@@ -31,10 +31,13 @@ export function floatToPcm16(input, channels) {
 export class BrowserAudio extends EventTarget {
   #context = null;
   #gain = null;
+  #speaker = null;
+  #outputReady = null;
   #nextPlaybackTime = 0;
   #sources = new Set();
   #microphoneStream = null;
   #microphoneNode = null;
+  #microphoneSource = null;
   #microphoneSink = null;
   #microphoneBytes = new Uint8Array();
   #sendMicrophone;
@@ -61,13 +64,38 @@ export class BrowserAudio extends EventTarget {
       this.#gain.connect(this.#context.destination);
     }
     await this.#context.resume();
+    if (!this.#outputReady) {
+      this.#outputReady = this.#initializeSpeaker();
+    }
+    await this.#outputReady;
     this.dispatchEvent(new CustomEvent("output", { detail: true }));
+  }
+
+  async #initializeSpeaker() {
+    if (!this.#context.audioWorklet || typeof AudioWorkletNode === "undefined") return;
+    try {
+      await this.#context.audioWorklet.addModule("/speaker-processor.js");
+      this.#speaker = new AudioWorkletNode(this.#context, "passport-speaker", {
+        numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+      });
+      this.#speaker.connect(this.#gain);
+      this.#speaker.port.onmessage = ({ data }) => {
+        this.dispatchEvent(new CustomEvent("status", { detail: data }));
+      };
+    } catch (error) {
+      // Keep playback available on browsers without AudioWorklet support.
+      console.warn("AudioWorklet unavailable; using scheduled audio buffers", error);
+    }
   }
 
   play(packet) {
     if (packet.bits !== 16 || ![1, 2].includes(packet.channels)) return;
-    const bytes = new Uint8Array(packet.bytes);
+    const bytes = packet.bytes instanceof Uint8Array ? packet.bytes : new Uint8Array(packet.bytes);
     if (!this.#context || this.#context.state !== "running") {
+      return;
+    }
+    if (this.#speaker) {
+      this.#speaker.port.postMessage({ ...packet, bytes }, [bytes.buffer]);
       return;
     }
     const frames = Math.floor(bytes.byteLength / (packet.channels * 2));
@@ -113,6 +141,7 @@ export class BrowserAudio extends EventTarget {
   }
 
   reset() {
+    this.#speaker?.port.postMessage({ type: "reset" });
     for (const source of this.#sources) source.stop();
     this.#sources.clear();
     this.#nextPlaybackTime = 0;
@@ -131,18 +160,25 @@ export class BrowserAudio extends EventTarget {
         noiseSuppression: false,
       },
     });
-    const source = this.#context.createMediaStreamSource(this.#microphoneStream);
-    this.#microphoneNode = new AudioWorkletNode(this.#context, "passport-mic");
-    this.#microphoneSink = this.#context.createGain();
-    this.#microphoneSink.gain.value = 0;
-    this.#microphoneNode.port.onmessage = (event) => this.#handleMicrophone(event.data);
-    source.connect(this.#microphoneNode);
-    this.#microphoneNode.connect(this.#microphoneSink);
-    this.#microphoneSink.connect(this.#context.destination);
-    this.dispatchEvent(new CustomEvent("microphone", { detail: true }));
+    try {
+      const source = this.#microphoneSource = this.#context.createMediaStreamSource(this.#microphoneStream);
+      this.#microphoneNode = new AudioWorkletNode(this.#context, "passport-mic");
+      this.#microphoneSink = this.#context.createGain();
+      this.#microphoneSink.gain.value = 0;
+      this.#microphoneNode.port.onmessage = (event) => this.#handleMicrophone(event.data);
+      source.connect(this.#microphoneNode);
+      this.#microphoneNode.connect(this.#microphoneSink);
+      this.#microphoneSink.connect(this.#context.destination);
+      this.dispatchEvent(new CustomEvent("microphone", { detail: true }));
+    } catch (error) {
+      this.stopMicrophone();
+      throw error;
+    }
   }
 
   stopMicrophone() {
+    this.#microphoneSource?.disconnect();
+    this.#microphoneSource = null;
     this.#microphoneNode?.disconnect();
     this.#microphoneSink?.disconnect();
     for (const track of this.#microphoneStream?.getTracks() || []) track.stop();
@@ -158,19 +194,8 @@ export class BrowserAudio extends EventTarget {
   }
 
   #handleMicrophone(samples) {
-    const resampled = resampleMono(
-      new Float32Array(samples),
-      this.#context.sampleRate,
-      this.#format.sampleRate,
-    );
-    const next = floatToPcm16(resampled, this.#format.channels);
-    const combined = new Uint8Array(this.#microphoneBytes.length + next.length);
-    combined.set(this.#microphoneBytes);
-    combined.set(next, this.#microphoneBytes.length);
-    this.#microphoneBytes = combined;
-    while (this.#microphoneBytes.length >= 768) {
-      this.#sendMicrophone(this.#microphoneBytes.slice(0, 768));
-      this.#microphoneBytes = this.#microphoneBytes.slice(768);
-    }
+    if (!this.#microphoneStream) return;
+    // RX format belongs to the virtual microphone, not the speaker's TX format.
+    this.#sendMicrophone(samples instanceof Float32Array ? samples : new Float32Array(samples), this.#context.sampleRate);
   }
 }

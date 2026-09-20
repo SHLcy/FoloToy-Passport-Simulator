@@ -1,3 +1,4 @@
+import { MicrophoneQueue, MicrophoneResampler } from './microphone.js';
 const I2S_BASE = 0x6002d000;
 const I2S_RX_CONF = I2S_BASE + 0x20;
 const I2S_TX_CONF = I2S_BASE + 0x24;
@@ -48,7 +49,7 @@ function decodeDmaChannels(conf, tdmCtrl) {
 function decodeI2sFormat(registers, fallback) {
   const { conf, conf1, clkmConf, clkmDivConf, tdmCtrl = 0 } = registers;
   if (!(conf & I2S_START) || (conf & (1 << 3)) || (conf & (1 << 20))) {
-    return { ...fallback };
+    return fallback;
   }
   const sourceSelection = (clkmConf >>> 27) & 0x3;
   const sourceClock = sourceSelection === 0
@@ -77,7 +78,7 @@ function decodeI2sFormat(registers, fallback) {
     sampleRate < 1000 ||
     sampleRate > 384000
   ) {
-    return { ...fallback };
+    return fallback;
   }
   return {
     sampleRate,
@@ -142,7 +143,10 @@ export class Esp32C3I2S {
     this.txRoots = [0, 0, 0];
     this.rxRoots = [0, 0, 0];
     this.irqAsserted = [false, false, false];
-    this.microphone = [];
+    this.microphone = new MicrophoneQueue();
+    this.micResampler = new MicrophoneResampler();
+    this.micFormat = '';
+    this.micStats = { capturedFrames: 0, deliveredBytes: 0, sampleRate: 0, channels: 0, level: 0 };
     this.nextTxAt = 0;
     this.nextRxAt = 0;
   }
@@ -159,6 +163,8 @@ export class Esp32C3I2S {
       this.nextRx.fill(0);
       this.rxRoots.fill(0);
       this.nextRxAt = 0;
+      this.microphone.length = 0;
+      this.micResampler.reset();
     }
   }
 
@@ -177,16 +183,32 @@ export class Esp32C3I2S {
     this.volume = Math.max(0, Math.min(100, volume));
   }
 
-  pushMicrophone(bytes) {
-    const input = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-    for (const value of input) this.microphone.push(value);
+  pushMicrophone(samples, sourceRate) {
+    if (!(samples instanceof Float32Array) || !Number.isFinite(sourceRate) || sourceRate <= 0) return;
+    this.micStats.capturedFrames += samples.length;
+    let energy = 0;
+    for (const value of samples) energy += value * value;
+    this.micStats.level = Math.sqrt(energy / Math.max(1, samples.length));
+    // An authorized browser mic is not necessarily an active firmware recording.
+    // Drop samples until RX starts, so old conversations cannot build a backlog.
+    if (!(this._i2sRegister(I2S_RX_CONF) & I2S_START)) return;
+    const format = this._format('rx');
+    const key = `${sourceRate}:${format.sampleRate}:${format.channels}`;
+    if (key !== this.micFormat) {
+      this.micFormat = key;
+      this.micResampler.reset();
+      this.microphone = new MicrophoneQueue(Math.ceil(format.sampleRate / 4) * format.channels * 2);
+    }
+    this.micStats.sampleRate = format.sampleRate;
+    this.micStats.channels = format.channels;
+    this.microphone.push(this.micResampler.convert(samples, sourceRate, format.sampleRate, format.channels));
   }
 
   pump(now = performance.now(), force = false) {
     const txReady = force || now >= this.nextTxAt;
     const rxReady = force || now >= this.nextRxAt;
-    const txFormat = this._format('tx');
-    const rxFormat = this._format('rx');
+    const txFormat = txReady ? this._format('tx') : this.defaultFormat;
+    const rxFormat = rxReady ? this._format('rx') : this.defaultFormat;
     let txBytes = 0;
     let rxBytes = 0;
     for (let channel = 0; channel < 3; channel += 1) {
@@ -279,6 +301,7 @@ export class Esp32C3I2S {
     if (!item.fields.owner || item.fields.size === 0) return 0;
 
     for (let offset = 0; offset < item.fields.size; offset += 1) {
+      if (this.microphone.length) this.micStats.deliveredBytes++;
       this._writeGuest8(
         item.buffer + offset,
         this.microphone.length ? this.microphone.shift() : 0,
@@ -359,7 +382,9 @@ export class Esp32C3I2S {
   }
 
   _memory() {
-    return new DataView(this.wasm.memory.buffer);
+    const buffer = this.wasm.memory.buffer;
+    if (this.memoryView?.buffer !== buffer) this.memoryView = new DataView(buffer);
+    return this.memoryView;
   }
 
   _i2sRegister(address) {
@@ -371,6 +396,23 @@ export class Esp32C3I2S {
 
   _format(direction) {
     const tx = direction === 'tx';
+    const rxConf = this._i2sRegister(I2S_RX_CONF);
+    const txConf = this._i2sRegister(I2S_TX_CONF);
+    // Full-duplex RX can be a slave of the on-chip TX clock. Preserve RX
+    // slots/width while deriving its sample rate from the shared BCK/WS.
+    if (!tx && (rxConf & I2S_START) && (rxConf & 8) && !(rxConf & (1 << 20)) &&
+        (txConf & (1 << 27)) && !(txConf & 8)) {
+      const clock = decodeI2sFormat({
+        conf: txConf | I2S_START,
+        conf1: this._i2sRegister(I2S_TX_CONF1),
+        clkmConf: this._i2sRegister(I2S_TX_CLKM_CONF),
+        clkmDivConf: this._i2sRegister(I2S_TX_CLKM_DIV_CONF),
+        tdmCtrl: this._i2sRegister(I2S_TX_TDM_CTRL),
+      }, this.defaultFormat);
+      const bits = ((this._i2sRegister(I2S_RX_CONF1) >>> 13) & 0x1f) + 1;
+      if (bits === 16) return {sampleRate: clock.sampleRate, bits,
+        channels: decodeDmaChannels(rxConf, this._i2sRegister(I2S_RX_TDM_CTRL))};
+    }
     return decodeI2sFormat({
       conf: this._i2sRegister(tx ? I2S_TX_CONF : I2S_RX_CONF),
       conf1: this._i2sRegister(tx ? I2S_TX_CONF1 : I2S_RX_CONF1),

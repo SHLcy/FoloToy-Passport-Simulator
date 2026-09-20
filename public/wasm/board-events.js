@@ -28,7 +28,7 @@ export class BoardEventBridge {
     wasm.ap_board_set_event_buffer(this.pointer, capacity);
   }
 
-  drain() {
+  drain({ copyPayload = true } = {}) {
     const length = this.wasm.ap_board_take_events() >>> 0;
     if (length > this.capacity) {
       throw new Error(`Invalid board event length: ${length}`);
@@ -52,7 +52,9 @@ export class BoardEventBridge {
       if (end > length) {
         throw new Error(`Truncated board event payload at ${offset}`);
       }
-      const payload = bytes.slice(offset + HEADER_BYTES, end);
+      const payload = copyPayload
+        ? bytes.slice(offset + HEADER_BYTES, end)
+        : bytes.subarray(offset + HEADER_BYTES, end);
       if (type === BoardEventType.SPI_TX) {
         events.push({ type: "spi", bus: channel, bytes: payload });
       } else if (

@@ -375,12 +375,37 @@ body.inspector-open .emulator { margin-right: min(440px, 36vw); }
   outline: none;
 }
 .simulator-action:not(:disabled):active { background: rgba(67, 238, 160, .14); }
-.screenshot-feedback {
+.recording-toggle {
+  display: flex;
+  width: auto;
+  min-width: 82px;
+  gap: 5px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.recording-toggle .recording-icon { color: var(--danger); }
+.recording-toggle .recording-stop-icon { display: none; }
+.recording-toggle[aria-pressed="true"] {
+  border-color: var(--danger);
+  color: #ffaaa5;
+  background: rgba(70, 17, 22, .94);
+}
+.recording-toggle[aria-pressed="true"] .recording-icon { display: none; }
+.recording-toggle[aria-pressed="true"] .recording-stop-icon { display: block; }
+#recording-time { font-variant-numeric: tabular-nums; }
+#recording-time[hidden] { display: none; }
+.capture-feedbacks {
   position: absolute;
   top: max(68px, calc(env(safe-area-inset-top) + 68px));
   right: max(16px, env(safe-area-inset-right));
   z-index: 5;
   max-width: min(240px, calc(100% - 32px));
+  display: grid;
+  gap: 6px;
+}
+.screenshot-feedback {
   padding: 8px 10px;
   border: 1px solid rgba(226, 238, 241, .22);
   border-radius: 4px;
@@ -395,6 +420,8 @@ body.inspector-open .emulator { margin-right: min(440px, 36vw); }
 .screenshot-feedback[data-state="success"] { color: var(--mint); }
 .screenshot-feedback[data-state="error"] { color: #ffaaa5; }
 .screenshot-feedback[hidden] { display: none; }
+#recording-download { display: block; margin-top: 6px; color: var(--mint); }
+#recording-download[hidden] { display: none; }
 .stage:fullscreen,
 .stage.is-fullscreen {
   width: 100vw;

@@ -162,6 +162,7 @@ function guestTcpFrame({
   flags,
   payload = new Uint8Array(),
   destinationIp = REMOTE_IP,
+  window = 65535,
 }) {
   return buildIpv4Frame({
     sourceMac: GUEST_MAC,
@@ -177,6 +178,7 @@ function guestTcpFrame({
       sequence,
       acknowledgment,
       flags,
+      window,
       payload,
     }),
   });
@@ -328,7 +330,8 @@ test("reclaims unresponsive WebSocket sessions and releases capacity", async () 
   assert.equal(capacityLog.active_sessions, 8);
   assert.equal(capacityLog.max_sessions, 8);
 
-  await wait(35);
+  const deadline = Date.now() + 1000;
+  while (!sockets.every(socket => socket.destroyed) && Date.now() < deadline) await wait(10);
   assert.ok(sockets.every((socket) => socket.destroyed));
   assert.equal(
     records.filter((record) => record.event === "network_bridge_session_expired").length,
@@ -540,6 +543,92 @@ test("blocks guest TCP connections to private destinations by default", () => {
   const response = parseTcpPacket(parseIpv4Frame(sent[0]).payload);
   assert.equal(response.flags, 0x14);
   session.close();
+});
+
+function slidingStream(initial = 9000, options = {}) {
+  class Socket extends EventEmitter {
+    setNoDelay() {} setTimeout() {} pause() {} resume() {} destroy() {}
+    write() {} end() { this.ended = true; }
+  }
+  const socket = new Socket(), sent = [];
+  const session = new EthernetNatSession({ ...options, randomUint32: () => initial,
+    createTcpConnection: () => socket, sendFrame: frame => sent.push(parseTcpPacket(parseIpv4Frame(frame).payload)) });
+  session.receive(guestTcpFrame({ sequence: 1000, flags: 2 }));
+  socket.emit('connect');
+  const start = (initial + 1) >>> 0;
+  const ack = (value, window = 5200, flags = 16) => session.receive(guestTcpFrame({
+    sequence: 1001, acknowledgment: value >>> 0, flags, window,
+  }));
+  ack(start);
+  sent.length = 0;
+  return { socket, sent, session, start, ack };
+}
+
+test('streams a full receive window before delayed ACK, then honors cumulative ACKs', () => {
+  const { socket, sent, session, start, ack } = slidingStream();
+  try {
+    const data = Buffer.from(Array.from({ length: 15600 }, (_, i) => i % 251));
+    socket.emit('data', data);
+    assert.equal(sent.length, 4);
+    assert.equal(sent.at(-1).sequence + sent.at(-1).payload.length, start + 5200);
+    ack(start + 2600);
+    assert.equal(sent.length, 6);
+    ack(start + 7800);
+    assert.equal(sent.length, 10);
+    ack(start + 13000);
+    assert.deepEqual(Buffer.concat(sent.map(p => Buffer.from(p.payload))), data);
+    ack(start + 15600);
+    socket.emit('end');
+    assert.equal(sent.at(-1).flags, 17);
+    // Do not discard the flow before acknowledging the peer's final FIN.
+    ack(start + 15601);
+    assert.equal(session.tcpFlows.size, 1);
+    ack(start + 15601, 5200, 17);
+    assert.equal(sent.at(-1).flags, 16);
+    assert.equal(session.tcpFlows.size, 0);
+  } finally { session.close(); }
+});
+
+test('zero/shrinking windows and partial or invalid ACKs cannot overrun the guest', () => {
+  const { socket, sent, session, start, ack } = slidingStream();
+  try {
+    socket.emit('data', Buffer.alloc(20000));
+    assert.equal(sent.length, 4);
+    ack(start + 90000); // impossible ACK
+    ack(start - 1); // stale ACK
+    ack(start + 100, 1000); // outstanding bytes exceed the newly reduced window
+    assert.equal(sent.length, 4);
+    ack(start + 5200, 0);
+    assert.equal(sent.length, 4);
+    ack(start + 5200, 600);
+    assert.equal(sent.length, 5);
+    assert.equal(sent.at(-1).payload.length, 600);
+  } finally { session.close(); }
+});
+
+test('sliding acknowledgments survive 32-bit sequence wraparound', () => {
+  const { socket, sent, session, start, ack } = slidingStream(0xfffff000);
+  try {
+    socket.emit('data', Buffer.alloc(10400));
+    assert.equal(sent.length, 4);
+    ack(start + 5200);
+    assert.equal(sent.length, 8);
+    ack(start + 10400);
+    assert.equal([...session.tcpFlows.values()][0].inFlight.length, 0);
+  } finally { session.close(); }
+});
+
+test('missing ACKs retransmit original bytes without losing subsequent segments', async () => {
+  const { socket, sent, session, start, ack } = slidingStream();
+  try {
+    socket.emit('data', Buffer.alloc(7800, 42));
+    assert.equal(sent.length, 4);
+    await wait(850);
+    assert.equal(sent.length, 8);
+    for (let i = 0; i < 4; i++) assert.deepEqual(sent[i + 4], sent[i]);
+    ack(start + 5200);
+    assert.equal(sent.length, 10);
+  } finally { session.close(); }
 });
 
 test("suppresses connection events until network debugging is enabled", () => {

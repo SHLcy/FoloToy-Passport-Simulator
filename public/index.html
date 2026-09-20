@@ -38,6 +38,8 @@
                   aria-pressed="false" title="启用扬声器输出">声音</button>
           <button id="microphone-toggle" class="audio-control" type="button"
                   aria-pressed="false" title="授权麦克风输入">授权 MIC</button>
+          <button id="virtual-wifi-connect" class="audio-control" type="button" hidden
+                  title="为小智写入模拟 Wi-Fi 配置并重启；刷新页面后可恢复原始固件">连接模拟 Wi-Fi</button>
           <button id="inspector-toggle" class="inspector-toggle" type="button"
                   aria-controls="debug-panel" aria-expanded="false"
                   aria-label="打开 Debug 检查器" title="Debug 检查器">
@@ -138,6 +140,18 @@
                   <path d="m5 12 4 4L19 6"></path>
                 </svg>
               </button>
+              <button id="recording-toggle" class="simulator-action recording-toggle"
+                      type="button" aria-pressed="false" aria-busy="false" disabled
+                      aria-label="开始录制 AI Passport 屏幕" title="开始录制 AI Passport 屏幕">
+                <svg class="recording-icon" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor">
+                  <circle cx="12" cy="12" r="6"></circle>
+                </svg>
+                <svg class="recording-stop-icon" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+                </svg>
+                <span id="recording-label">录屏</span>
+                <span id="recording-time" role="timer" aria-live="off" hidden>00:00</span>
+              </button>
               <button id="fullscreen-toggle" class="simulator-action fullscreen-toggle"
                       type="button" aria-controls="simulator-stage"
                       aria-pressed="false" aria-label="全屏显示模拟器"
@@ -162,8 +176,14 @@
                 </svg>
               </button>
             </div>
-            <output id="screenshot-feedback" class="screenshot-feedback"
-                    aria-live="polite" hidden></output>
+            <div class="capture-feedbacks">
+              <output id="screenshot-feedback" class="screenshot-feedback"
+                      aria-live="polite" hidden></output>
+              <div id="recording-feedback" class="screenshot-feedback" hidden>
+                <span id="recording-message" role="status" aria-live="polite"></span>
+                <a id="recording-download" download hidden>下载视频</a>
+              </div>
+            </div>
             <img class="shell-art" src="/assets/ai-passport-shell-reference.png" alt="">
             <div class="screen-bezel">
               <canvas id="qemu-display" width="240" height="320" aria-label="QEMU firmware display"></canvas>
@@ -249,6 +269,8 @@
           <span id="debug-sample-state">等待采样</span>
         </div>
         <div id="register-grid" class="register-grid"></div>
+        <p id="audio-status" class="muted">声音诊断：等待播放</p>
+        <p id="microphone-status" class="muted">麦克风：等待授权与固件录音</p>
       </section>
 
       <section class="debug-view uart-view" data-debug-view="uart" aria-label="UART console" hidden>

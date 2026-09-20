@@ -85,3 +85,17 @@ test('acknowledges DMA IRQs before the next PCM deadline', async () => {
   assert.equal(audio.pump(101),0);
   assert.deepEqual(acknowledged,[0,1,2]);
 });
+
+test('XiaoZhi slave RX follows the shared 24 kHz TX clock and retains RX slots',async()=>{
+ const {Esp32C3I2S}=await import('../public/wasm/i2s.js');
+ const audio=new Esp32C3I2S({}, {__wbg_ptr:0},0);
+ const registers={0x20:0x8000c,0x24:0x8080004,0x28:0x2f3de38f,0x2c:0x2f3de38f,0x30:0x3400001a,0x34:0x3400001a,0x38:0x5c0001,0x3c:0x5c0001,0x50:0x10003,0x54:0x10003};
+ audio._i2sRegister=address=>registers[address-0x6002d000]??0;
+ assert.deepEqual(audio._format('rx'),{sampleRate:24000,bits:16,channels:2});
+ registers[0x50]=0x10001;
+ assert.deepEqual(audio._format('rx'),{sampleRate:24000,bits:16,channels:1});
+ registers[0x24]&=~4;
+ assert.equal(audio._format('rx').sampleRate,24000);
+ registers[0x24]&=~(1<<27);
+ assert.equal(audio._format('rx').sampleRate,16000);
+});
