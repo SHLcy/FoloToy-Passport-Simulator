@@ -8,7 +8,17 @@ const VIDEO_TYPES = [
 export function supportsScreenRecording(canvas, Recorder = globalThis.MediaRecorder) {
   return typeof canvas?.captureStream === "function" &&
     typeof Recorder === "function" &&
-    VIDEO_TYPES.some((type) => Recorder.isTypeSupported(type));
+    Boolean(selectRecordingType(Recorder));
+}
+
+export function selectRecordingType(Recorder = globalThis.MediaRecorder) {
+  if (typeof Recorder !== "function") return null;
+  if (typeof Recorder.isTypeSupported !== "function") {
+    // Older Safari versions expose MediaRecorder without the static probe and
+    // record canvas streams as MP4 by default.
+    return "video/mp4";
+  }
+  return VIDEO_TYPES.find((type) => Recorder.isTypeSupported(type)) || null;
 }
 
 export function recordingFilename(mimeType, date = new Date()) {
@@ -38,8 +48,9 @@ export function startScreenRecording(canvas, {
   const stream = capture.captureStream(60);
   let recorder;
   try {
+    const mimeType = selectRecordingType(Recorder);
     recorder = new Recorder(stream, {
-      mimeType: VIDEO_TYPES.find((type) => Recorder.isTypeSupported(type)),
+      mimeType,
       videoBitsPerSecond: 2_000_000,
     });
   } catch (error) {

@@ -11,7 +11,8 @@ export class PcmRing {
   reset() {
     this.read = 0; this.write = 0; this.phase = 0;
     this.inputRate = 0; this.buffering = true;
-    this.targetMs = 80; this.underruns = 0; this.overruns = 0;
+    this.targetMs = 40; this.maxBufferedMs = 160;
+    this.underruns = 0; this.overruns = 0;
     this.fade = 0; this.lastLeft = 0; this.lastRight = 0;
     this.inputFrames = 0; this.outputFrames = 0;
   }
@@ -25,9 +26,10 @@ export class PcmRing {
     const frames = Math.floor(bytes.byteLength / (packet.channels * 2));
     const gain = Math.max(0, Math.min(1, (packet.volume ?? 100) / 100)) / 32768;
     // Bound latency after suspension. Ordinary bursts stay contiguous.
+    let dropped = false;
     if (this.write - this.read + frames >= this.capacity) {
       this.read = this.write; this.phase = 0; this.buffering = true;
-      this.overruns++;
+      dropped = true;
     }
     const start = Math.max(0, frames - this.capacity + 1);
     for (let i = start; i < frames; i++) {
@@ -36,6 +38,17 @@ export class PcmRing {
       this.left[index] = view.getInt16(offset, true) * gain;
       this.right[index] = packet.channels === 1 ? this.left[index] : view.getInt16(offset + 2, true) * gain;
     }
+    // The emulator can briefly produce PCM faster than the browser consumes it.
+    // Keep the newest audio instead of turning that burst into seconds of delay.
+    const maxBufferedFrames = Math.floor(this.inputRate * this.maxBufferedMs / 1000);
+    const excess = this.write - this.read - maxBufferedFrames;
+    if (excess > 0) {
+      this.read += excess;
+      this.phase = 0;
+      this.fade = 32;
+      dropped = true;
+    }
+    if (dropped) this.overruns++;
     this.inputFrames += frames;
   }
   render(left, right) {
@@ -57,7 +70,7 @@ export class PcmRing {
           left[j] = this.lastLeft * gain; right[j] = this.lastRight * gain;
         }
         this.buffering = true; this.underruns++;
-        this.targetMs = Math.min(180, this.targetMs + 20);
+        this.targetMs = Math.min(100, this.targetMs + 20);
         break;
       }
       const a = (this.read + offset) % this.capacity, b = (a + 1) % this.capacity;

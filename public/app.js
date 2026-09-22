@@ -1,4 +1,5 @@
 import { supportsVirtualProvisioning, provisionXiaozhi } from "./provisioning.js";
+import { FirmwareOperationGate } from "./firmware-operation.js";
 import { QemuRuntime } from "./runtime.js";
 import { BrowserAudio } from "./audio.js";
 import {
@@ -692,13 +693,22 @@ runtime.addEventListener("microphone-status", ({ detail }) => {
 });
 const virtualWifiButton = document.querySelector('#virtual-wifi-connect');
 let provisionableFirmware = null;
-let provisionGeneration = 0;
+const firmwareOperations = new FirmwareOperationGate();
+
+function beginFirmwareOperation() {
+  const operation = firmwareOperations.begin();
+  provisionableFirmware = null;
+  virtualWifiButton.hidden = true;
+  virtualWifiButton.disabled = true;
+  return operation;
+}
+
 runtime.addEventListener('firmware', async ({ detail }) => {
-  const generation = ++provisionGeneration;
+  const operation = firmwareOperations.current();
   provisionableFirmware = null;
   virtualWifiButton.hidden = true;
   try {
-    if (await supportsVirtualProvisioning(detail.bytes) && generation === provisionGeneration) {
+    if (await supportsVirtualProvisioning(detail.bytes) && firmwareOperations.isCurrent(operation)) {
       provisionableFirmware = detail.bytes;
       virtualWifiButton.hidden = false;
       virtualWifiButton.disabled = false;
@@ -707,19 +717,18 @@ runtime.addEventListener('firmware', async ({ detail }) => {
 });
 virtualWifiButton.addEventListener('click', async () => {
   const firmware = provisionableFirmware;
-  const generation = provisionGeneration;
   if (!firmware) return;
-  virtualWifiButton.disabled = true;
+  const operation = beginFirmwareOperation();
   try {
     const response = await fetch('/assets/provisioning/xiaozhi-wifi.nvs');
     if (!response.ok) throw new Error('读取模拟配网配置失败');
     const configured = await provisionXiaozhi(firmware, new Uint8Array(await response.arrayBuffer()));
-    if (generation !== provisionGeneration) return;
+    if (!firmwareOperations.isCurrent(operation)) return;
     log('已为小智写入模拟 Wi-Fi 配置，正在重启。此操作只修改本次模拟的虚拟 Flash。');
     await runtime.loadFirmware(configured);
   } catch (error) {
     log(`模拟配网失败：${error.message}`);
-    if (generation === provisionGeneration) virtualWifiButton.disabled = false;
+    if (firmwareOperations.isCurrent(operation)) virtualWifiButton.disabled = false;
   }
 });
 runtime.addEventListener("firmware", () => {
@@ -926,6 +935,7 @@ async function configureFirmwareSources() {
 }
 
 async function loadPresetFirmware(button) {
+  const operation = beginFirmwareOperation();
   const firmwareName = button.dataset.firmwareName;
   const firmwareUrl = button.dataset.firmwareUrl;
   const previousFirmwareName = activeFirmwareName;
@@ -946,11 +956,13 @@ async function loadPresetFirmware(button) {
     const response = await fetch(firmwareUrl, { cache: "no-store" });
     if (!response.ok) throw new Error(`镜像请求失败: ${response.status}`);
     const firmware = await readFirmwareResponse(response, firmwareName);
+    if (!firmwareOperations.isCurrent(operation)) return;
     setLoadingProgress(62, "正在校验固件", formatFirmwareSize(firmware.byteLength));
     validateFirmwareFile({ name: firmwareUrl, size: firmware.byteLength });
     log(`加载 ${firmwareName} (${formatFirmwareSize(firmware.byteLength)})`);
     await runtime.loadFirmware(firmware);
   } catch (error) {
+    if (!firmwareOperations.isCurrent(operation)) return;
     pendingPresetId = previousPendingPresetId;
     activeFirmwareName = previousFirmwareName;
     setUploadBusy(false);
@@ -978,6 +990,7 @@ uploadControl.addEventListener("click", () => {
 
 async function importCommunityFirmware() {
   if (!communityPlayUrl.reportValidity()) return;
+  const operation = beginFirmwareOperation();
   const previousFirmwareName = activeFirmwareName;
   const previousRuntimeState = currentRuntimeState;
   const previousRuntimeDetail = runtimeState.textContent;
@@ -1004,6 +1017,7 @@ async function importCommunityFirmware() {
     }
 
     const firmware = await readFirmwareResponse(response, "社区固件");
+    if (!firmwareOperations.isCurrent(operation)) return;
     let firmwareName = response.headers.get("x-firmware-name") || "社区固件";
     try {
       firmwareName = decodeURIComponent(firmwareName);
@@ -1017,6 +1031,7 @@ async function importCommunityFirmware() {
     log(`导入 ${firmwareName} (${formatFirmwareSize(firmware.byteLength)})`);
     await runtime.loadFirmware(firmware);
   } catch (error) {
+    if (!firmwareOperations.isCurrent(operation)) return;
     pendingPresetId = previousPendingPresetId;
     activeFirmwareName = previousFirmwareName;
     setUploadBusy(false);
@@ -1054,6 +1069,7 @@ firmwareInput.addEventListener("change", async () => {
   if (!allowLocalFirmwareUpload) return;
   if (!file) return;
 
+  const operation = beginFirmwareOperation();
   const previousFirmwareName = activeFirmwareName;
   const previousRuntimeState = currentRuntimeState;
   const previousRuntimeDetail = runtimeState.textContent;
@@ -1068,8 +1084,11 @@ firmwareInput.addEventListener("change", async () => {
     presetFeedback.textContent = `正在加载本地固件 ${file.name}`;
     renderPresetStates();
     log(`加载 ${file.name} (${formatFirmwareSize(file.size)})`);
-    await runtime.loadFirmware(await readLocalFirmware(file));
+    const firmware = await readLocalFirmware(file);
+    if (!firmwareOperations.isCurrent(operation)) return;
+    await runtime.loadFirmware(firmware);
   } catch (error) {
+    if (!firmwareOperations.isCurrent(operation)) return;
     pendingPresetId = undefined;
     activeFirmwareName = previousFirmwareName;
     setUploadBusy(false);
@@ -1143,7 +1162,9 @@ async function startApplication() {
     return;
   }
 
+  const operation = beginFirmwareOperation();
   runtime.start(initialPresetButton.dataset.firmwareUrl).catch((error) => {
+    if (!firmwareOperations.isCurrent(operation)) return;
     setUploadBusy(false);
     setRuntimeState("waiting", "等待 WASM QEMU");
     overlay.classList.add("is-error");

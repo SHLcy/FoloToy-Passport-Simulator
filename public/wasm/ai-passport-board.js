@@ -54,7 +54,10 @@ export class AiPassportBoard {
         continue;
       }
       if (event.type === 'audio') {
-        this.onAudio(event);
+        // Board events may point directly into wasm.memory. The worker transfers
+        // audio buffers to the main thread, and a WebAssembly.Memory buffer is
+        // not transferable. Give audio its own backing ArrayBuffer first.
+        this.onAudio({ ...event, bytes: event.bytes.slice() });
         continue;
       }
       this.onUnknownEvent(event);

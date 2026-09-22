@@ -42,3 +42,11 @@ test('overload is bounded and cannot overwrite unread ring data', () => {
   ring.push(packet(6000)); ring.push(packet(12000));
   assert.equal(ring.overruns,1); assert.ok(ring.write-ring.read<8192);
 });
+test('producer bursts cannot accumulate seconds of playback latency', () => {
+  const ring = new PcmRing(48000), l = new Float32Array(128), r = new Float32Array(128);
+  ring.push(packet(48000 * 3));
+  assert.ok(ring.status().bufferedMs <= 160);
+  ring.render(l, r);
+  assert.equal(ring.buffering, false);
+  assert.ok(l.some(value => value !== 0));
+});

@@ -631,6 +631,51 @@ test('missing ACKs retransmit original bytes without losing subsequent segments'
   } finally { session.close(); }
 });
 
+test('partial ACK progress resets retries and retransmits only the unacknowledged suffix', () => {
+  const timers = [];
+  const setTimeoutFn = (callback, delayMs) => {
+    const timer = { callback, delayMs, active: true, unref() {} };
+    timers.push(timer);
+    return timer;
+  };
+  const clearTimeoutFn = (timer) => { if (timer) timer.active = false; };
+  const fireCurrentTimer = (tracked) => {
+    const timer = tracked.timer;
+    assert.equal(timer.active, true);
+    timer.active = false;
+    timer.callback();
+  };
+  const { socket, sent, session, start, ack } = slidingStream(9000, {
+    setTimeoutFn,
+    clearTimeoutFn,
+  });
+  try {
+    socket.emit('data', Buffer.alloc(1300, 42));
+    const flow = [...session.tcpFlows.values()][0];
+    let tracked = flow.inFlight[0];
+    for (let attempt = 0; attempt < 5; attempt++) fireCurrentTimer(tracked);
+    assert.equal(tracked.attempts, 5);
+
+    ack(start + 100);
+    tracked = flow.inFlight[0];
+    assert.equal(tracked.attempts, 0);
+    assert.equal(tracked.start, start + 100);
+    assert.equal(tracked.payload.byteLength, 1200);
+    fireCurrentTimer(tracked);
+    const retransmission = sent.at(-1);
+    assert.equal(retransmission.sequence, start + 100);
+    assert.equal(retransmission.payload.byteLength, 1200);
+
+    for (let attempt = 1; attempt < 5; attempt++) fireCurrentTimer(tracked);
+    ack(start + 200);
+    assert.equal(flow.closed, false);
+    assert.equal(tracked.attempts, 0);
+    assert.equal(tracked.payload.byteLength, 1100);
+    ack(start + 1300);
+    assert.equal(flow.inFlight.length, 0);
+  } finally { session.close(); }
+});
+
 test("suppresses connection events until network debugging is enabled", () => {
   const events = [];
   const session = new EthernetNatSession({

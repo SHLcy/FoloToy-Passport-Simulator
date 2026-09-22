@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   recordingFilename,
+  selectRecordingType,
   startScreenRecording,
   supportsScreenRecording,
 } from "../public/screen-recording.js";
@@ -97,6 +98,17 @@ test("unsupported browsers fail before allocating capture resources", () => {
   assert.equal(supportsScreenRecording(source, null), false);
   assert.throws(() => startScreenRecording(source, options), /不支持屏幕录制/);
   assert.equal(state.draws, 0);
+});
+
+test("MediaRecorder implementations without a static codec probe use Safari MP4", async () => {
+  const { source, options, state } = harness();
+  Object.defineProperty(options.Recorder, "isTypeSupported", { value: undefined });
+
+  assert.equal(selectRecordingType(options.Recorder), "video/mp4");
+  assert.equal(supportsScreenRecording(source, options.Recorder), true);
+  const blob = await startScreenRecording(source, options).stop();
+  assert.equal(state.recorder.mimeType, "video/mp4");
+  assert.equal(blob.type, "video/mp4");
 });
 
 test("constructor and start failures release the stream", () => {

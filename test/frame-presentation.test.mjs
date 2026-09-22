@@ -30,3 +30,37 @@ test('frames are presented at animation frames and stale workers cannot draw aft
     assert.notEqual(workers[1].sent.at(-1).type,'frame-presented');
   } finally { Object.assign(globalThis, originals); }
 });
+
+test('a completed older download cannot replace a newer firmware load', async () => {
+  const originals = { Worker: globalThis.Worker, fetch: globalThis.fetch };
+  const workers = [];
+  let finishDownload;
+  class Worker extends EventTarget {
+    constructor() { super(); workers.push(this); }
+    postMessage() {}
+    terminate() {}
+  }
+  globalThis.Worker = Worker;
+  globalThis.fetch = async (url) => {
+    if (url === '/wasm/manifest.json') {
+      return { ok: true, json: async () => ({ worker: '/test-worker' }) };
+    }
+    return {
+      ok: true,
+      body: null,
+      headers: { get: () => null },
+      arrayBuffer: () => new Promise(resolve => { finishDownload = resolve; }),
+    };
+  };
+  try {
+    const runtime = new QemuRuntime();
+    await runtime.loadFirmware(new ArrayBuffer(1));
+    const older = runtime.start('/slow.bin');
+    await Promise.resolve();
+    await runtime.loadFirmware(new ArrayBuffer(2));
+    finishDownload(new ArrayBuffer(3));
+
+    assert.equal(await older, false);
+    assert.equal(workers.length, 2);
+  } finally { Object.assign(globalThis, originals); }
+});

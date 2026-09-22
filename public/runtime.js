@@ -7,25 +7,33 @@ export class QemuRuntime extends EventTarget {
   #manifest = null;
   #networkDebug = false;
   #cpuDebug = false;
+  #loadGeneration = 0;
 
   async start(firmwareUrl) {
+    const generation = ++this.#loadGeneration;
     this.#ready = false;
     this.dispatchEvent(new CustomEvent("state", { detail: "loading" }));
     this.#reportProgress(3, "正在读取运行配置", "定位 QEMU WASM 运行时");
     const manifest = await this.#loadManifest();
+    if (generation !== this.#loadGeneration) return false;
     this.#reportProgress(7, "正在请求固件", firmwareUrl || manifest.firmware);
     const response = await fetch(firmwareUrl || manifest.firmware, { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`Firmware request failed: ${response.status}`);
     }
-    const firmware = await this.#readFirmwareResponse(response);
+    const firmware = await this.#readFirmwareResponse(response, generation);
+    if (!firmware || generation !== this.#loadGeneration) return false;
     this.#launchWorker(manifest, firmware);
+    return true;
   }
 
   async loadFirmware(firmware) {
+    const generation = ++this.#loadGeneration;
     this.#reportProgress(64, "正在准备虚拟设备", "加载 QEMU WASM 运行配置");
     const manifest = await this.#loadManifest();
+    if (generation !== this.#loadGeneration) return false;
     this.#launchWorker(manifest, firmware);
+    return true;
   }
 
   #reportProgress(value, stage, detail) {
@@ -34,7 +42,7 @@ export class QemuRuntime extends EventTarget {
     }));
   }
 
-  async #readFirmwareResponse(response) {
+  async #readFirmwareResponse(response, generation) {
     const total = Number(response.headers.get("content-length")) || 0;
     if (!response.body) {
       const firmware = await response.arrayBuffer();
@@ -47,6 +55,10 @@ export class QemuRuntime extends EventTarget {
     let loaded = 0;
     while (true) {
       const { done, value } = await reader.read();
+      if (generation !== this.#loadGeneration) {
+        await reader.cancel();
+        return null;
+      }
       if (done) break;
       chunks.push(value);
       loaded += value.byteLength;
