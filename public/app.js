@@ -236,6 +236,7 @@ function setUartPaused(paused) {
 
 function setRuntimeState(state, detail) {
   currentRuntimeState = state;
+  syncVirtualWifiControl();
   syncRecordingControl();
   runtimeState.textContent = detail || state;
   runtimeState.title = detail || state;
@@ -695,23 +696,27 @@ const virtualWifiButton = document.querySelector('#virtual-wifi-connect');
 let provisionableFirmware = null;
 const firmwareOperations = new FirmwareOperationGate();
 
+function syncVirtualWifiControl() {
+  virtualWifiButton.hidden = !provisionableFirmware;
+  virtualWifiButton.disabled = !provisionableFirmware || currentRuntimeState !== "running";
+}
+
 function beginFirmwareOperation() {
   const operation = firmwareOperations.begin();
   provisionableFirmware = null;
-  virtualWifiButton.hidden = true;
-  virtualWifiButton.disabled = true;
+  syncVirtualWifiControl();
+  setUploadBusy(true);
   return operation;
 }
 
 runtime.addEventListener('firmware', async ({ detail }) => {
   const operation = firmwareOperations.current();
   provisionableFirmware = null;
-  virtualWifiButton.hidden = true;
+  syncVirtualWifiControl();
   try {
     if (await supportsVirtualProvisioning(detail.bytes) && firmwareOperations.isCurrent(operation)) {
       provisionableFirmware = detail.bytes;
-      virtualWifiButton.hidden = false;
-      virtualWifiButton.disabled = false;
+      syncVirtualWifiControl();
     }
   } catch (error) { log(`配网适配检查失败：${error.message}`); }
 });
@@ -728,7 +733,11 @@ virtualWifiButton.addEventListener('click', async () => {
     await runtime.loadFirmware(configured);
   } catch (error) {
     log(`模拟配网失败：${error.message}`);
-    if (firmwareOperations.isCurrent(operation)) virtualWifiButton.disabled = false;
+    if (firmwareOperations.isCurrent(operation)) {
+      provisionableFirmware = firmware;
+      setUploadBusy(false);
+      syncVirtualWifiControl();
+    }
   }
 });
 runtime.addEventListener("firmware", () => {
